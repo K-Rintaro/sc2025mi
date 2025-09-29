@@ -1,0 +1,18 @@
+[package]
+name = "seccamp2025mini_online"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = "1.10.1"
+serde_json = "1.0.128"
+reqwest = { version = "0.12.8", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+
+[[bin]]
+name = "basic"
+path = "src/basic.rs"
+
+[[bin]]
+name = "advanced"
+path = "src/advanced.rs"
