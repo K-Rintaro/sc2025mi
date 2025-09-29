@@ -271,7 +271,6 @@ fn perform_userpass_auth(stream: &mut TcpStream) -> io::Result<()> {
 }
 
 // リクエスト（CONNECT 等）の読み取り部分です。
-// クライアントの要求（VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT）を解析して Request を返します。
 fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header)?;

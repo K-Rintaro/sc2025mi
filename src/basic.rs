@@ -210,7 +210,6 @@ fn send_method_selection(stream: &mut TcpStream, method: u8) -> io::Result<()> {
 }
 
 // リクエスト（CONNECT 等）の読み取り部分です。
-// クライアントの要求（VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT）を解析して Request を返します。
 fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header)?;
@@ -286,7 +285,6 @@ fn send_reply(stream: &mut TcpStream, reply: Reply, bound: Option<SocketAddr>) -
     response.push(reply.code()); //REP
     response.push(0x00); //RSV(0)
 
-    // 応答の BND はサーバ側のバインドアドレス（None の場合は 0.0.0.0:0）
     let bound_addr = bound.unwrap_or_else(default_bound_address);
     match bound_addr {
         SocketAddr::V4(addr) => {
