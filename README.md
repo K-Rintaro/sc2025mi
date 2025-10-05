@@ -10,6 +10,8 @@ Both files implement the functionality necessary to operate as a conformant SOCK
 
 At present, I am uncertain about the appropriate difficulty level, as I have not yet reviewed any application materials. With guidance from subject-matter experts, I would like to determine which functions should be completed by students. If refactoring is required, I will address it promptly.
 
+Amendment (October 5): I have completed the code refactoring and will use it as the template for this lecture.
+
 ## Plan
 
 Looking ahead a three-hour lecture, I propose the following schedule and content plan. I would be grateful for any advice regarding this outline.
@@ -21,4 +23,4 @@ Looking ahead a three-hour lecture, I propose the following schedule and content
     - Request parsing and validation
     - CONNECT request and successful response flow
     - Packet capture and analysis with Wireshark
-    - (Optional) Advanced implementation of RFC 1929
+    - (Optional) Either an advanced implementation of RFC 1929 (Username/Password Authentication) or a straightforward inspection module.
