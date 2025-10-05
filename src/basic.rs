@@ -1,364 +1,223 @@
-//クレートの呼び出し部分です
-use std::fmt;
+// SOCKS5 学習用修正版 配列でそのまま扱う実装コード
+// ここで各種クレートを読み込みます
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::thread;
 
-//VER(プロトコルバージョン)を指定するものです。
-const SOCKS5_VERSION: u8 = 5;
-//認証不要のために定義されている値（X'00'）です。
-const NO_AUTH_METHOD: u8 = 0x00;
-//受け入れられるメソッドがないことを示す値（X'FF'）です。
-const NO_ACCEPTABLE_METHOD: u8 = 0xFF;
-
-//リクエストのフォーマットです。
-//CMD（コマンド）, 宛先アドレス（ATYP+ADDR）, 宛先ポート（PORT）が保持されます。
-#[derive(Debug, Clone)]
-struct Request {
-    command: Command,
-    address: Address,
-    port: u16,
-}
-
-//各ATYP（アドレスタイプ）に対応する列挙型です。
-#[derive(Debug, Clone)]
-enum Address {
-    Ipv4(Ipv4Addr),
-    Domain(String),
-    Ipv6(Ipv6Addr),
-}
-
-//各CMD（コマンド）の列挙型です。
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum Command {
-    Connect,
-    Bind,
-    UdpAssociate,
-    Unknown(u8),
-}
-
-//REP（リプライフィールド）の列挙型です。
-//エラー内容は必要に応じて拡張可能です。
-#[derive(Debug, Copy, Clone)]
-enum Reply {
-    Succeeded = 0x00,
-    GeneralFailure = 0x01,
-    CommandNotSupported = 0x07,
-}
-
-//リクエストに基づいて宛先にTCP接続を行います。
-impl Request {
-    fn connect(&self) -> io::Result<TcpStream> {
-        match &self.address {
-            Address::Ipv4(addr) => {
-                TcpStream::connect(SocketAddr::new(IpAddr::V4(*addr), self.port))
-            }
-            Address::Ipv6(addr) => {
-                TcpStream::connect(SocketAddr::new(IpAddr::V6(*addr), self.port))
-            }
-            Address::Domain(host) => TcpStream::connect((host.as_str(), self.port)),
-        }
-    }
-}
-
-//ログ出力用の部分です。
-impl fmt::Display for Request {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}:{}", self.command, self.address, self.port)
-    }
-}
-impl fmt::Display for Address {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Address::Ipv4(addr) => write!(f, "{addr}"),
-            Address::Ipv6(addr) => write!(f, "[{addr}]"),
-            Address::Domain(host) => write!(f, "{host}"),
-        }
-    }
-}
-impl From<u8> for Command {
-    fn from(code: u8) -> Self {
-        match code {
-            0x01 => Command::Connect,
-            0x02 => Command::Bind,
-            0x03 => Command::UdpAssociate,
-            other => Command::Unknown(other),
-        }
-    }
-}
-impl fmt::Display for Command {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Command::Connect => write!(f, "CONNECT"),
-            Command::Bind => write!(f, "BIND"),
-            Command::UdpAssociate => write!(f, "UDP ASSOCIATE"),
-            Command::Unknown(code) => write!(f, "UNKNOWN(0x{code:02X})"),
-        }
-    }
-}
-impl Reply {
-    fn code(self) -> u8 {
-        self as u8
-    }
-}
-
-//---ここからメインの関数です。---
 fn main() -> io::Result<()> {
-    //8080ポートで待ち受けます。
+    // 1) リスナーを立てる（8080番ポートをリッスン）
     let listener = TcpListener::bind("127.0.0.1:8080")?;
-    println!("SOCKS5 proxy listening on {}", listener.local_addr()?);
+    println!("SOCKS5 proxy running on {}", listener.local_addr()?);
 
-    //接続を受け付けます。
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let peer = stream.peer_addr().ok();
+    for incoming in listener.incoming() {
+        match incoming {
+            Ok(mut client) => {
                 thread::spawn(move || {
-                    if let Some(peer) = peer {
-                        println!("Accepted connection from {peer}");
-                    } else {
-                        println!("Accepted connection from unknown peer");
-                    }
-
-                    if let Err(err) = handle_client(stream) {
-                        eprintln!("Client error: {err}");
+                    if let Err(e) = handle_client_inline(&mut client) {
+                        eprintln!("client error: {e}");
+                        let _ = client.shutdown(Shutdown::Both);
                     }
                 });
             }
-            Err(err) => eprintln!("Failed to accept connection: {err}"),
+            Err(e) => eprintln!("accept error: {e}"),
         }
     }
-
     Ok(())
 }
 
-//接続の処理本体
-fn handle_client(mut client: TcpStream) -> io::Result<()> {
-    //1. メソッドの交渉: クライアントが提示するメソッドを受信します。
-    let methods = read_greeting(&mut client)?;
-    println!("Client supports methods: {}", describe_methods(&methods));
-
-    //2. 認証方式の選択: 今回は認証不要のみとします。
-    if !methods.contains(&NO_AUTH_METHOD) {
-        send_method_selection(&mut client, NO_ACCEPTABLE_METHOD)?;
+fn handle_client_inline(client: &mut TcpStream) -> io::Result<()> {
+    // 2) Greeting を読む: [VER, NMETHODS, METHODS]
+    let mut head2 = [0u8; 2];
+    client.read_exact(&mut head2)?; // VER, NMETHODS
+    let ver = head2[0];
+    let nmethods = head2[1] as usize;
+    if ver != 0x05 {
         return Err(io::Error::new(
-            ErrorKind::Other,
-            "client did not offer the no-authentication method",
+            ErrorKind::InvalidData,
+            format!("unsupported version: {ver}"),
         ));
     }
 
-    // 認証不要で応答します。
-    send_method_selection(&mut client, NO_AUTH_METHOD)?;
-
-    //リクエストを読み取ります
-    let request = read_request(&mut client)?;
-    println!("Request: {request}");
-
-    //CONNECTについてのみ今回は実装します。そのためCONNECT以外はここでエラーを返します。
-    if request.command != Command::Connect {
-        send_reply(&mut client, Reply::CommandNotSupported, None)?;
-        return Err(io::Error::new(
-            ErrorKind::Other,
-            "only CONNECT command is supported",
-        ));
+    let mut methods = vec![0u8; nmethods];
+    if nmethods > 0 {
+        client.read_exact(&mut methods)?;
     }
+    println!("methods offered: {:?}", methods);
 
-    //宛先にTCP接続します。
-    let remote = match request.connect() {
-        Ok(stream) => stream,
-        Err(err) => {
-            //失敗時は一般的な失敗の応答をします。
-            send_reply(&mut client, Reply::GeneralFailure, None)?;
-            return Err(err);
-        }
+    // 3) METHOD 選択（No Auth 0x00 があれば採用。なければ 0xFF）
+    let chosen = if methods.iter().any(|&m| m == 0x00) {
+        0x00
+    } else {
+        0xFF
     };
+    let selection = vec![0x05, chosen];
+    client.write_all(&selection)?;
+    client.flush()?;
+    if chosen == 0xFF {
+        return Err(io::Error::new(ErrorKind::Other, "no acceptable method"));
+    }
 
-    //ここから成功応答の記述です。
-    let bound_addr = remote
-        .local_addr()
-        .unwrap_or_else(|_| default_bound_address());
-    send_reply(&mut client, Reply::Succeeded, Some(bound_addr))?;
-
-    //双方向中継の記述です。
-    bridge(client, remote)?;
-    println!("Finished forwarding {request}");
-    Ok(())
-}
-
-//クライアントの一番最初のGreeting（VER, NMETHODS, METHODS…）を読み取ります。
-fn read_greeting(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
-    let mut header = [0u8; 2];
-    stream.read_exact(&mut header)?;
-
-    if header[0] != SOCKS5_VERSION {
+    // 4) Request を読む: [VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT]
+    let mut req_hdr = [0u8; 4];
+    client.read_exact(&mut req_hdr)?;
+    let ver = req_hdr[0];
+    let cmd = req_hdr[1];
+    let rsv = req_hdr[2];
+    let atyp = req_hdr[3];
+    if ver != 0x05 || rsv != 0x00 {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
-            format!("unsupported SOCKS version: {}", header[0]),
+            "malformed request header",
         ));
     }
 
-    let count = header[1] as usize;
-    let mut methods = vec![0u8; count];
-    stream.read_exact(&mut methods)?;
-    Ok(methods)
-}
-
-// サーバのメソッド選択応答（VER, METHOD）を送信します。
-fn send_method_selection(stream: &mut TcpStream, method: u8) -> io::Result<()> {
-    stream.write_all(&[SOCKS5_VERSION, method])?;
-    stream.flush()
-}
-
-// リクエスト（CONNECT 等）の読み取り部分です。
-fn read_request(stream: &mut TcpStream) -> io::Result<Request> {
-    let mut header = [0u8; 4];
-    stream.read_exact(&mut header)?;
-
-    //VER 検証
-    if header[0] != SOCKS5_VERSION {
+    if cmd != 0x01 {
+        // CONNECT 以外は未対応
+        // 失敗応答（Command not supported = 0x07）を配列で作成
+        let mut rep = vec![0x05, 0x07, 0x00, 0x01]; // [VER, REP, RSV, ATYP(IPv4)]
+        rep.extend_from_slice(&[0, 0, 0, 0]); // BND.ADDR
+        rep.extend_from_slice(&[0, 0]); // BND.PORT
+        client.write_all(&rep)?;
+        client.flush()?;
         return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("unsupported SOCKS version: {}", header[0]),
+            ErrorKind::Other,
+            "only CONNECT is supported",
         ));
     }
 
-    //CMD 識別
-    let command = Command::from(header[1]);
-
-    // RSVが0であることを確認します
-    if header[2] != 0 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "reserved byte must be zero",
-        ));
+    // 5) DST.ADDR と DST.PORT の読み取り（ATYPに応じて可変長）
+    enum Dst {
+        V4([u8; 4], u16),
+        V6([u8; 16], u16),
+        Domain(String, u16),
     }
 
-    // ATYP に基づき DST.ADDR を可変長で読み取ります
-    let address = match header[3] {
+    let dst = match atyp {
         0x01 => {
-            //IPv4は4バイトです
-            let mut octets = [0u8; 4];
-            stream.read_exact(&mut octets)?;
-            Address::Ipv4(Ipv4Addr::from(octets))
+            // IPv4
+            let mut ip4 = [0u8; 4];
+            client.read_exact(&mut ip4)?;
+            let mut p = [0u8; 2];
+            client.read_exact(&mut p)?;
+            let port = u16::from_be_bytes(p);
+            Dst::V4(ip4, port)
         }
         0x03 => {
-            //DOMAINはLEN(1バイト)+ドメイン名です
-            let mut length = [0u8; 1];
-            stream.read_exact(&mut length)?;
-            let mut domain = vec![0u8; length[0] as usize];
-            stream.read_exact(&mut domain)?;
-            Address::Domain(String::from_utf8_lossy(&domain).into_owned())
+            // DOMAIN
+            let mut len = [0u8; 1];
+            client.read_exact(&mut len)?;
+            let mut name = vec![0u8; len[0] as usize];
+            if !name.is_empty() {
+                client.read_exact(&mut name)?;
+            }
+            let mut p = [0u8; 2];
+            client.read_exact(&mut p)?;
+            let port = u16::from_be_bytes(p);
+            let host = String::from_utf8_lossy(&name).into_owned();
+            Dst::Domain(host, port)
         }
         0x04 => {
-            //IPv6は16バイトです
-            let mut segments = [0u8; 16];
-            stream.read_exact(&mut segments)?;
-            Address::Ipv6(Ipv6Addr::from(segments))
+            // IPv6
+            let mut ip6 = [0u8; 16];
+            client.read_exact(&mut ip6)?;
+            let mut p = [0u8; 2];
+            client.read_exact(&mut p)?;
+            let port = u16::from_be_bytes(p);
+            Dst::V6(ip6, port)
         }
-        value => {
-            //変なATYPがくればエラーを返します
+        other => {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                format!("unsupported address type: 0x{value:02X}"),
+                format!("unsupported ATYP: 0x{other:02X}"),
             ));
         }
     };
 
-    //DST.PORTはビッグエンディアン2バイトです
-    let mut port_bytes = [0u8; 2];
-    stream.read_exact(&mut port_bytes)?;
-    let port = u16::from_be_bytes(port_bytes);
+    // 6) 宛先へ TCP 接続
 
-    Ok(Request {
-        command,
-        address,
-        port,
-    })
-}
+    // ログ（要求された宛先）を表示
+    let requested = match &dst {
+        Dst::V4(ip, port) => format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port),
+        Dst::V6(ip, port) => format!("[{}]:{}", Ipv6Addr::from(*ip), port),
+        Dst::Domain(host, port) => format!("{}:{}", host, port),
+    };
+    println!("Requested destination: {requested}");
 
-// 応答（REP）を送信します
-// 成功/失敗応答（VER, REP, RSV, ATYP, BND.ADDR, BND.PORT）を組み立てて送信します。
-fn send_reply(stream: &mut TcpStream, reply: Reply, bound: Option<SocketAddr>) -> io::Result<()> {
-    // 十分な容量を確保します。（最大で IPv6 + ポート）
-    let mut response = Vec::with_capacity(4 + 16 + 2);
-    response.push(SOCKS5_VERSION); //VER
-    response.push(reply.code()); //REP
-    response.push(0x00); //RSV(0)
-
-    let bound_addr = bound.unwrap_or_else(default_bound_address);
-    match bound_addr {
-        SocketAddr::V4(addr) => {
-            response.push(0x01); // ATYP=IPv4
-            response.extend_from_slice(&addr.ip().octets()); // BND.ADDR
-            response.extend_from_slice(&addr.port().to_be_bytes()); // BND.PORT
+    let remote = match &dst {
+        Dst::V4(ip, port) => {
+            let addr =
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])), *port);
+            TcpStream::connect(addr)
         }
-        SocketAddr::V6(addr) => {
+        Dst::V6(ip, port) => {
+            let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::from(*ip)), *port);
+            TcpStream::connect(addr)
+        }
+        Dst::Domain(host, port) => TcpStream::connect((host.as_str(), *port)),
+    };
+
+    let mut remote = match remote {
+        Ok(s) => s,
+        Err(e) => {
+            // 失敗時は General failure (0x01) を返す
+            let mut rep = vec![0x05, 0x01, 0x00, 0x01];
+            rep.extend_from_slice(&[0, 0, 0, 0]);
+            rep.extend_from_slice(&[0, 0]);
+            let _ = client.write_all(&rep);
+            let _ = client.flush();
+            return Err(e);
+        }
+    };
+
+    // 7) 成功応答: [VER, REP, RSV, ATYP, BND.ADDR, BND.PORT]
+    if let Ok(peer) = remote.peer_addr() {
+        println!("Connected to destination: {peer}");
+    }
+    let bound_addr = remote
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+    println!("Bound local address: {bound_addr}");
+
+    // 順に push し、ATYP は実アドレス種別で選択
+    let mut response = Vec::with_capacity(4 + 16 + 2);
+    response.push(0x05); // VER
+    response.push(0x00); // REP = succeeded
+    response.push(0x00); // RSV
+
+    match bound_addr {
+        SocketAddr::V4(a) => {
+            response.push(0x01); // ATYP=IPv4
+            response.extend_from_slice(&a.ip().octets());
+            response.extend_from_slice(&a.port().to_be_bytes());
+        }
+        SocketAddr::V6(a) => {
             response.push(0x04); // ATYP=IPv6
-            response.extend_from_slice(&addr.ip().octets()); // BND.ADDR
-            response.extend_from_slice(&addr.port().to_be_bytes()); // BND.PORT
+            response.extend_from_slice(&a.ip().octets());
+            response.extend_from_slice(&a.port().to_be_bytes());
         }
     }
 
-    stream.write_all(&response)?;
-    stream.flush()
-}
+    client.write_all(&response)?;
+    client.flush()?;
 
-//双方向中継の記述です。
-// クライアント <-> 宛先 を同時に中継します。
-// 1) client -> remote を別スレッドで copy
-// 2) main スレッドで remote -> client を copy
-// 3) それぞれ終了後、対応方向に Shutdown を適用し、綺麗にクローズします。
-fn bridge(mut client: TcpStream, mut remote: TcpStream) -> io::Result<()> {
-    // 送受を分けるためにクローンしておきます。
-    let mut client_reader = client.try_clone()?;
-    let mut remote_writer = remote.try_clone()?;
-
-    //client -> remote 方向の転送を別スレッドで実行します
+    // 8) 転送部分
+    let mut c_read = client.try_clone()?;
+    let mut r_write = remote.try_clone()?;
     let forward = thread::spawn(move || -> io::Result<()> {
-        let copied = io::copy(&mut client_reader, &mut remote_writer)?;
-        println!("Forwarded {copied} bytes client -> remote");
-         // 送信側を終了（書き込み側を閉じる）し、受信側は読み取りを閉じます
-        let _ = remote_writer.shutdown(Shutdown::Write);
-        let _ = client_reader.shutdown(Shutdown::Read);
+        let n = io::copy(&mut c_read, &mut r_write)?;
+        println!("client -> remote: {n} bytes");
+        let _ = r_write.shutdown(Shutdown::Write);
+        let _ = c_read.shutdown(Shutdown::Read);
         Ok(())
     });
 
-    // remote -> client 方向を転送します（こちらは現スレッド）
-    let copied_back = io::copy(&mut remote, &mut client)?;
-    println!("Forwarded {copied_back} bytes remote -> client");
+    let n = io::copy(&mut remote, client)?;
+    println!("remote -> client: {n} bytes");
     let _ = client.shutdown(Shutdown::Write);
     let _ = remote.shutdown(Shutdown::Read);
 
-    // 別スレッドの終了を待ちます
     match forward.join() {
-        Ok(result) => result,
-        Err(_) => Err(io::Error::new(
-            ErrorKind::Other,
-            "forwarding thread panicked",
-        )),
+        Ok(res) => res,
+        Err(_) => Err(io::Error::new(ErrorKind::Other, "forward thread panicked")),
     }
-}
-
-//ログ出力用の部分です。
-fn describe_methods(methods: &[u8]) -> String {
-    if methods.is_empty() {
-        return "none".to_string();
-    }
-
-    let parts: Vec<String> = methods
-        .iter()
-        .map(|&code| describe_auth_method(code))
-        .collect();
-    parts.join(", ")
-}
-fn describe_auth_method(code: u8) -> String {
-    match code {
-        NO_AUTH_METHOD => "No Authentication".to_string(),
-        0x01 => "GSSAPI".to_string(),
-        0x02 => "Username/Password".to_string(),
-        other => format!("Unknown(0x{other:02X})"),
-    }
-}
-fn default_bound_address() -> SocketAddr {
-    SocketAddr::from(([0, 0, 0, 0], 0))
 }
