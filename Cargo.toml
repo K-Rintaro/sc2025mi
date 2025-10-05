@@ -10,5 +10,9 @@ name = "basic"
 path = "src/basic.rs"
 
 [[bin]]
+name = "intermediate"
+path = "src/intermediate.rs"
+
+[[bin]]
 name = "advanced"
 path = "src/advanced.rs"

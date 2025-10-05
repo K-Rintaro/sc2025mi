@@ -1,14 +1,24 @@
-// SOCKS5 上級編: basic.rs と同じ構造を維持しつつ、RFC1929（ユーザ/パスワード認証）を追加
-
-use std::env;
+// SOCKS5 学習用: basic.rs を基に簡単なインスペクション（ドメイン遮断）を追加
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::thread;
 
+// 遮断対象のドメイン例。
+// 完全一致またはサフィックス一致（サブドメイン含む）で判定します。
+const BLOCKED_SUFFIXES: &[&str] = &["example.com", "bad.example"];
+
+fn is_blocked(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    BLOCKED_SUFFIXES.iter().any(|suf| {
+        let s = suf.to_ascii_lowercase();
+        h == s || h.ends_with(&format!(".{s}"))
+    })
+}
+
 fn main() -> io::Result<()> {
     // 1) リスナーを立てる（8080番ポートでリッスン）
     let listener = TcpListener::bind("127.0.0.1:8080")?;
-    println!("SOCKS5 (advanced) running on {}", listener.local_addr()?);
+    println!("SOCKS5 proxy (intermediate) on {}", listener.local_addr()?);
 
     for incoming in listener.incoming() {
         match incoming {
@@ -45,10 +55,8 @@ fn handle_client_inline(client: &mut TcpStream) -> io::Result<()> {
     }
     println!("methods offered: {:?}", methods);
 
-    // 3) METHOD 選択（まず 0x02=ユーザ/パスワード、なければ 0x00=No Auth。どちらも無ければ 0xFF）
-    let chosen = if methods.iter().any(|&m| m == 0x02) {
-        0x02
-    } else if methods.iter().any(|&m| m == 0x00) {
+    // 3) METHOD 選択（No Auth 0x00 があれば採用。なければ 0xFF）
+    let chosen = if methods.iter().any(|&m| m == 0x00) {
         0x00
     } else {
         0xFF
@@ -58,11 +66,6 @@ fn handle_client_inline(client: &mut TcpStream) -> io::Result<()> {
     client.flush()?;
     if chosen == 0xFF {
         return Err(io::Error::new(ErrorKind::Other, "no acceptable method"));
-    }
-
-    // 3.5) ユーザ/パスワード認証の実行（選択が 0x02 の場合のみ実施）
-    if chosen == 0x02 {
-        perform_userpass_auth_inline(client)?;
     }
 
     // 4) Request を読む: [VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT]
@@ -122,6 +125,21 @@ fn handle_client_inline(client: &mut TcpStream) -> io::Result<()> {
             client.read_exact(&mut p)?;
             let port = u16::from_be_bytes(p);
             let host = String::from_utf8_lossy(&name).into_owned();
+
+            // 簡単なインスペクション: 宛先ホスト名で遮断判定し、REP=0x02 を返す
+            if is_blocked(&host) {
+                println!("blocked by ruleset: {host}:{port}");
+                let mut rep = vec![0x05, 0x02, 0x00, 0x01]; // REP=0x02 (Connection not allowed by ruleset)
+                rep.extend_from_slice(&[0, 0, 0, 0]); // BND.ADDR
+                rep.extend_from_slice(&[0, 0]); // BND.PORT
+                client.write_all(&rep)?;
+                client.flush()?;
+                return Err(io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    format!("blocked host: {host}"),
+                ));
+            }
+
             Dst::Domain(host, port)
         }
         0x04 => {
@@ -208,7 +226,7 @@ fn handle_client_inline(client: &mut TcpStream) -> io::Result<()> {
     client.write_all(&response)?;
     client.flush()?;
 
-    // 8) 転送
+    // 8) 転送部分
     let mut c_read = client.try_clone()?;
     let mut r_write = remote.try_clone()?;
     let forward = thread::spawn(move || -> io::Result<()> {
@@ -227,56 +245,5 @@ fn handle_client_inline(client: &mut TcpStream) -> io::Result<()> {
     match forward.join() {
         Ok(res) => res,
         Err(_) => Err(io::Error::new(ErrorKind::Other, "forward thread panicked")),
-    }
-}
-
-
-// RFC1929: ユーザ/パスワード認証のサブネゴシエーション
-fn perform_userpass_auth_inline(stream: &mut TcpStream) -> io::Result<()> {
-    // クライアントから: ver(1)=0x01, ulen(1), uname, plen(1), passwd
-    let mut header = [0u8; 2];
-    stream.read_exact(&mut header)?;
-    let ver = header[0];
-    let ulen = header[1] as usize;
-    if ver != 0x01 {
-        // バージョン不正
-        let _ = stream.write_all(&[0x01, 0x01]);
-        let _ = stream.flush();
-        return Err(io::Error::new(ErrorKind::InvalidData, "invalid auth version"));
-    }
-
-    let mut uname_buf = vec![0u8; ulen];
-    if ulen > 0 {
-        stream.read_exact(&mut uname_buf)?;
-    }
-
-    let mut plen_buf = [0u8; 1];
-    stream.read_exact(&mut plen_buf)?;
-    let plen = plen_buf[0] as usize;
-
-    let mut pass_buf = vec![0u8; plen];
-    if plen > 0 {
-        stream.read_exact(&mut pass_buf)?;
-    }
-
-    let username = String::from_utf8_lossy(&uname_buf).to_string();
-    let password = String::from_utf8_lossy(&pass_buf).to_string();
-
-    // 認証情報は環境変数で設定可能（未設定時はデフォルト）
-    let expected_user = env::var("PROXY_USERNAME").unwrap_or_else(|_| "user".to_string());
-    let expected_pass = env::var("PROXY_PASSWORD").unwrap_or_else(|_| "password".to_string());
-
-    if username == expected_user && password == expected_pass {
-        stream.write_all(&[0x01, 0x00])?; // success
-        stream.flush()?;
-        println!("Authenticated user '{username}' successfully");
-        Ok(())
-    } else {
-        stream.write_all(&[0x01, 0x01])?; // failure
-        stream.flush()?;
-        Err(io::Error::new(
-            ErrorKind::PermissionDenied,
-            "invalid credentials",
-        ))
     }
 }
